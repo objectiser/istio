@@ -25,6 +25,7 @@ import (
 	"k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -306,10 +307,21 @@ func (c *Controller) ManagementPorts(addr string) model.PortList {
 	return managementPorts
 }
 
-func getReadinessProbes(podSpec *v1.PodSpec) []model.Probe {
+func isPortMatch(port intstr.IntOrString, endpoint *model.NetworkEndpoint) bool {
+	if port.Type == intstr.Int {
+		return port.IntValue() == 0 || port.IntValue() == endpoint.Port
+	} else if port.Type == intstr.String {
+		return port.String() == "" || (endpoint.ServicePort != nil &&
+			port.String() == endpoint.ServicePort.Name)
+	}
+	return false
+}
+
+func getReadinessProbes(podSpec *v1.PodSpec, endpoint *model.NetworkEndpoint) []model.Probe {
 	probes := make([]model.Probe, 0)
 	for _, container := range podSpec.Containers {
-		if container.ReadinessProbe != nil && container.ReadinessProbe.Handler.HTTPGet != nil {
+		if container.ReadinessProbe != nil && container.ReadinessProbe.Handler.HTTPGet != nil &&
+			isPortMatch(container.ReadinessProbe.Handler.HTTPGet.Port, endpoint) {
 			probes = append(probes, model.Probe{
 				Path: container.ReadinessProbe.Handler.HTTPGet.Path,
 			})
@@ -318,10 +330,11 @@ func getReadinessProbes(podSpec *v1.PodSpec) []model.Probe {
 	return probes
 }
 
-func getLivenessProbes(podSpec *v1.PodSpec) []model.Probe {
+func getLivenessProbes(podSpec *v1.PodSpec, endpoint *model.NetworkEndpoint) []model.Probe {
 	probes := make([]model.Probe, 0)
 	for _, container := range podSpec.Containers {
-		if container.LivenessProbe != nil && container.LivenessProbe.Handler.HTTPGet != nil {
+		if container.LivenessProbe != nil && container.LivenessProbe.Handler.HTTPGet != nil &&
+			isPortMatch(container.LivenessProbe.Handler.HTTPGet.Port, endpoint) {
 			probes = append(probes, model.Probe{
 				Path: container.LivenessProbe.Handler.HTTPGet.Path,
 			})
@@ -370,25 +383,28 @@ func (c *Controller) Instances(hostname model.Hostname, ports []string,
 						continue
 					}
 
-					pod, exists := c.pods.getPodByIP(ea.IP)
+					pod, podExists := c.pods.getPodByIP(ea.IP)
 					az, sa := "", ""
-					var readiness, liveness []model.Probe
-					if exists {
+					if podExists {
 						az, _ = c.GetPodAZ(pod)
 						sa = kubeToIstioServiceAccount(pod.Spec.ServiceAccountName, pod.GetNamespace(), c.domainSuffix)
-						readiness = getReadinessProbes(&pod.Spec)
-						liveness = getLivenessProbes(&pod.Spec)
 					}
 
 					// identify the port by name
 					for _, port := range ss.Ports {
 						if svcPort, exists := svcPorts[port.Name]; exists {
+							var readiness, liveness []model.Probe
+							endpoint := model.NetworkEndpoint{
+								Address:     ea.IP,
+								Port:        int(port.Port),
+								ServicePort: svcPort,
+							}
+							if podExists {
+								readiness = getReadinessProbes(&pod.Spec, &endpoint)
+								liveness = getLivenessProbes(&pod.Spec, &endpoint)
+							}
 							out = append(out, &model.ServiceInstance{
-								Endpoint: model.NetworkEndpoint{
-									Address:     ea.IP,
-									Port:        int(port.Port),
-									ServicePort: svcPort,
-								},
+								Endpoint:         endpoint,
 								Service:          svc,
 								Labels:           labels,
 								AvailabilityZone: az,
@@ -447,12 +463,9 @@ func (c *Controller) InstancesByPort(hostname model.Hostname, reqSvcPort int,
 
 					pod, exists := c.pods.getPodByIP(ea.IP)
 					az, sa := "", ""
-					var readiness, liveness []model.Probe
 					if exists {
 						az, _ = c.GetPodAZ(pod)
 						sa = kubeToIstioServiceAccount(pod.Spec.ServiceAccountName, pod.GetNamespace(), c.domainSuffix)
-						readiness = getReadinessProbes(&pod.Spec)
-						liveness = getLivenessProbes(&pod.Spec)
 					}
 
 					// identify the port by name. K8S EndpointPort uses the service port name
@@ -460,12 +473,18 @@ func (c *Controller) InstancesByPort(hostname model.Hostname, reqSvcPort int,
 						if port.Name == "" || // 'name optional if single port is defined'
 							reqSvcPort == 0 || // return all ports (mostly used by tests/debug)
 							svcPortEntry.Name == port.Name {
+							var readiness, liveness []model.Probe
+							endpoint := model.NetworkEndpoint{
+								Address:     ea.IP,
+								Port:        int(port.Port),
+								ServicePort: svcPortEntry,
+							}
+							if exists {
+								readiness = getReadinessProbes(&pod.Spec, &endpoint)
+								liveness = getLivenessProbes(&pod.Spec, &endpoint)
+							}
 							out = append(out, &model.ServiceInstance{
-								Endpoint: model.NetworkEndpoint{
-									Address:     ea.IP,
-									Port:        int(port.Port),
-									ServicePort: svcPortEntry,
-								},
+								Endpoint:         endpoint,
 								Service:          svc,
 								Labels:           labels,
 								AvailabilityZone: az,
@@ -516,6 +535,11 @@ func (c *Controller) GetProxyServiceInstances(proxy *model.Proxy) ([]*model.Serv
 						pod, exists := c.pods.getPodByIP(ea.IP)
 						az, sa := "", ""
 						var readiness, liveness []model.Probe
+						endpoint := model.NetworkEndpoint{
+							Address:     ea.IP,
+							Port:        int(port.Port),
+							ServicePort: svcPort,
+						}
 						if exists {
 							az, _ = c.GetPodAZ(pod)
 							sa = kubeToIstioServiceAccount(pod.Spec.ServiceAccountName, pod.GetNamespace(), c.domainSuffix)
@@ -526,15 +550,11 @@ func (c *Controller) GetProxyServiceInstances(proxy *model.Proxy) ([]*model.Serv
 									kubeNodes[ea.IP].PodName, kubeNodes[ea.IP].Namespace)
 								continue
 							}
-							readiness = getReadinessProbes(&pod.Spec)
-							liveness = getLivenessProbes(&pod.Spec)
+							readiness = getReadinessProbes(&pod.Spec, &endpoint)
+							liveness = getLivenessProbes(&pod.Spec, &endpoint)
 						}
 						out = append(out, &model.ServiceInstance{
-							Endpoint: model.NetworkEndpoint{
-								Address:     ea.IP,
-								Port:        int(port.Port),
-								ServicePort: svcPort,
-							},
+							Endpoint:         endpoint,
 							Service:          svc,
 							Labels:           labels,
 							AvailabilityZone: az,
