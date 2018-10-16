@@ -1,0 +1,6 @@
+apiVersion: io.jaegertracing/v1alpha1
+kind: Jaeger
+metadata:
+  name: istio-tracing
+  namespace: {{ .Release.Namespace }}
+
